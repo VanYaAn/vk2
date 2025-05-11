@@ -1,0 +1,619 @@
+Okay, я готов помочь с доработкой задания.
+
+Давай разберем задачу по шагам.
+
+**Существующий код (`example.txt`)**
+
+Это реализация Pub-Sub шины на Go. Ключевые моменты:
+*   `SubPubImplementation`: Основная структура, управляющая подписками и публикациями.
+*   `Subscribe`: Подписывает обработчик (`MessageHandler`) на указанную тему (`subject`). Создает для каждого подписчика отдельную горутину (`dispatchMessages`) и канал для сообщений.
+*   `Publish`: Отправляет сообщение всем подписчикам указанной темы. Делает это асинхронно для каждого подписчика, чтобы медленные подписчики не блокировали остальных.
+*   `Unsubscribe`: Отписывает конкретного подписчика.
+*   `Close`: Завершает работу всей системы, отменяет контексты подписчиков и ожидает завершения всех обработчиков.
+*   Используются контексты для управления жизненным циклом и `sync.Mutex`/`sync.RWMutex` для безопасного доступа к разделяемым данным.
+*   Канал сообщений у подписчика буферизирован (`defaultSubscriberMessageBufferSize`). Если канал переполнен, новые сообщения для этого подписчика будут отброшены (в `Publish` есть `select` с `default` веткой при отправке в `s.messages`).
+
+**Задача (из скриншота)**
+
+Нужно реализовать gRPC сервис поверх этой Pub-Sub шины.
+
+1.  **Protobuf схема:** Уже дана.
+    *   `Subscribe(SubscribeRequest) returns (stream Event)`: Клиент отправляет `SubscribeRequest` с `key` (это будет `subject` для нашей шины), а сервер в ответ стримит `Event`'ы, каждый из которых содержит `data` (это будет наше сообщение).
+    *   `Publish(PublishRequest) returns (google.protobuf.Empty)`: Клиент отправляет `PublishRequest` с `key` (subject) и `data` (сообщение). Сервер отвечает пустым сообщением в случае успеха.
+
+2.  **Требования к решению:**
+    *   Описание сервиса и как его собирать.
+    *   Конфигурация портов и параметров (на усмотрение).
+    *   Логирование.
+    *   Использование известных паттернов (DI, graceful shutdown и т.д. приветствуются).
+    *   Ссылка на GitHub репозиторий.
+
+**План действий:**
+
+1.  **Создать структуру проекта:**
+    *   `proto/`: для `.proto` файла и сгенерированного кода.
+    *   `pkg/subpub/`: сюда поместим код из `example.txt`.
+    *   `internal/service/`: для реализации gRPC сервиса.
+    *   `cmd/server/`: для `main.go`, который будет запускать сервер.
+    *   `README.md`: описание.
+    *   `Makefile`: для генерации proto и сборки.
+
+2.  **Сгенерировать Go код из Protobuf:** Используем `protoc`.
+
+3.  **Реализовать gRPC сервис (`internal/service/grpc_server.go`):**
+    *   Создать структуру `Server`, которая будет реализовывать `pb.PubSubServer`.
+    *   Эта структура будет содержать экземпляр нашей `subpub.SubPub` шины (инъекция зависимости).
+    *   Реализовать метод `Publish`:
+        *   Принимает `PublishRequest`.
+        *   Вызывает `subpub.Publish(req.Key, req.Data)`.
+        *   Обрабатывает ошибки и возвращает gRPC статус.
+    *   Реализовать метод `Subscribe`:
+        *   Принимает `SubscribeRequest` и `stream pb.PubSub_SubscribeServer`.
+        *   Вызывает `s.subpub.Subscribe(req.Key, messageHandler)`.
+        *   `messageHandler` должен:
+            *   Принимать `interface{}` от шины.
+            *   Приводить его к `string` (т.к. `Event.Data` это `string`). Если не строка, логировать ошибку или пропускать.
+            *   Создавать `pb.Event{Data: ...}`.
+            *   Отправлять его в `stream.Send()`.
+            *   Обрабатывать ошибки отправки (например, если клиент отсоединился).
+        *   Нужно корректно обработать отсоединение клиента: когда `stream.Context().Done()` сигнализирует, нужно вызвать `subscription.Unsubscribe()`.
+        *   Использовать `defer subscription.Unsubscribe()` для очистки при выходе из функции.
+
+4.  **Создать `main` приложение (`cmd/server/main.go`):**
+    *   Инициализировать `subpub.NewSubPub()`.
+    *   Инициализировать gRPC сервер, передав ему экземпляр subpub.
+    *   Запустить gRPC сервер на определенном порту (порт можно брать из env или флага).
+    *   Реализовать Graceful Shutdown: слушать сигналы ОС (SIGINT, SIGTERM), при получении вызывать `grpcServer.GracefulStop()` и затем `subpubEngine.Close()`.
+    *   Добавить базовое логирование.
+
+5.  **Написать `README.md` и `Makefile`.**
+
+Давай начнем с создания структуры проекта и генерации кода.
+
+**Шаг 1: Структура проекта и `.proto` файл**
+
+Предположим, наш проект называется `grpc_pubsub_service`.
+
+```
+grpc_pubsub_service/
+├── cmd/
+│   └── server/
+│       └── main.go
+├── internal/
+│   └── service/
+│       └── grpc_server.go
+├── pkg/
+│   └── subpub/
+│       └── subpub.go  // Код из example.txt
+├── proto/
+│   └── pubsub.proto   // Описание сервиса из задания
+├── go.mod
+├── go.sum
+├── Makefile
+└── README.md
+```
+
+Содержимое `proto/pubsub.proto`:
+```protobuf
+syntax = "proto3";
+
+package proto;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/your_username/grpc_pubsub_service/proto;proto"; // Замените на ваш путь
+
+service PubSub {
+    // Подписка (сервер отправляет поток событий)
+    rpc Subscribe(SubscribeRequest) returns (stream Event);
+    // Публикация (классический запрос-ответ)
+    rpc Publish(PublishRequest) returns (google.protobuf.Empty);
+}
+
+message SubscribeRequest {
+    string key = 1; // Тема для подписки
+}
+
+message PublishRequest {
+    string key = 1;  // Тема для публикации
+    string data = 2; // Данные для публикации
+}
+
+message Event {
+    string data = 1; // Данные события
+}
+```
+**Важно:** Я добавил `option go_package` для корректной генерации Go-кода. Замените `github.com/your_username/grpc_pubsub_service/proto;proto` на актуальный путь к вашему модулю.
+
+**Шаг 2: Генерация Go кода из Protobuf**
+
+Для этого понадобится `protoc`, `protoc-gen-go` и `protoc-gen-go-grpc`.
+Установите их, если не установлены:
+```bash
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
+```
+Убедитесь, что `$GOPATH/bin` (или `$HOME/go/bin`) есть в вашем `PATH`.
+
+Создадим `Makefile`:
+```makefile
+.PHONY: proto clean build run
+
+# Путь к вашим .proto файлам
+PROTO_DIR=./proto
+# Выходная директория для сгенерированного Go кода
+PROTO_OUT_DIR=.
+
+# Команда для генерации Protobuf
+PROTOC=protoc
+
+# Флаги для protoc
+PROTOC_FLAGS=--go_out=$(PROTO_OUT_DIR) --go_opt=paths=source_relative \
+             --go-grpc_out=$(PROTO_OUT_DIR) --go-grpc_opt=paths=source_relative
+
+# Имя вашего сервиса
+SERVICE_NAME=grpc_pubsub_server
+BIN_DIR=./bin
+
+proto:
+	@echo "Generating protobuf code..."
+	$(PROTOC) -I=$(PROTO_DIR) $(PROTOC_FLAGS) $(PROTO_DIR)/*.proto
+	@echo "Protobuf code generated."
+
+build: proto
+	@echo "Building $(SERVICE_NAME)..."
+	go build -o $(BIN_DIR)/$(SERVICE_NAME) ./cmd/server/main.go
+	@echo "$(SERVICE_NAME) built in $(BIN_DIR)/"
+
+run: build
+	@echo "Running $(SERVICE_NAME)..."
+	$(BIN_DIR)/$(SERVICE_NAME)
+
+clean:
+	@echo "Cleaning up..."
+	rm -f $(BIN_DIR)/$(SERVICE_NAME)
+	rm -f $(PROTO_DIR)/*.pb.go
+	@echo "Cleaned."
+
+# Инициализация модуля, если его еще нет
+init-mod:
+	go mod init github.com/your_username/grpc_pubsub_service # Замените на ваш путь
+	go mod tidy
+```
+Замените `github.com/your_username/grpc_pubsub_service` на ваш путь к модулю в `go.mod` и в `option go_package` в `.proto` файле.
+
+После создания `Makefile` и `proto/pubsub.proto`, выполните:
+1.  `go mod init github.com/your_username/grpc_pubsub_service` (если еще не сделали)
+2.  `make proto`
+
+Это создаст `proto/pubsub.pb.go` и `proto/pubsub_grpc.pb.go`.
+
+**Шаг 3: Копирование `subpub` кода**
+
+Скопируйте код из `example.txt` в `pkg/subpub/subpub.go`. Убедитесь, что `package subpub` указано верно.
+
+**Шаг 4: Реализация gRPC сервиса (`internal/service/grpc_server.go`)**
+
+```go
+package service
+
+import (
+	"context"
+	"fmt"
+	"log" // Простое логирование для примера
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	"github.com/your_username/grpc_pubsub_service/pkg/subpub" // Замените на ваш путь
+	pb "github.com/your_username/grpc_pubsub_service/proto"   // Замените на ваш путь
+)
+
+// Server реализует pb.PubSubServer интерфейс
+type Server struct {
+	pb.UnimplementedPubSubServer // Для обратной совместимости
+	subpubEngine                 subpub.SubPub
+	logger                       *log.Logger // Для логирования
+}
+
+// NewGRPCServer создает новый экземпляр сервера
+func NewGRPCServer(sp subpub.SubPub, logger *log.Logger) *Server {
+	return &Server{
+		subpubEngine: sp,
+		logger:       logger,
+	}
+}
+
+// Publish обрабатывает запрос на публикацию сообщения
+func (s *Server) Publish(ctx context.Context, req *pb.PublishRequest) (*emptypb.Empty, error) {
+	if req.Key == "" {
+		s.logger.Printf("Publish: received empty key")
+		return nil, status.Error(codes.InvalidArgument, "key cannot be empty")
+	}
+	if req.Data == "" {
+		// Можно разрешить пустые данные, но для примера сделаем их обязательными
+		s.logger.Printf("Publish: received empty data for key '%s'", req.Key)
+		return nil, status.Error(codes.InvalidArgument, "data cannot be empty")
+	}
+
+	s.logger.Printf("Publish: publishing to key '%s', data: '%.20s...'", req.Key, req.Data) // Логируем только начало данных
+
+	// Используем req.Data (string) как есть. Наш subpub принимает interface{}
+	err := s.subpubEngine.Publish(req.Key, req.Data)
+	if err != nil {
+		s.logger.Printf("Publish: error publishing to key '%s': %v", req.Key, err)
+		// Преобразуем ошибку subpub в gRPC статус
+		// Можно сделать более гранулированное преобразование, если subpub возвращает разные типы ошибок
+		return nil, status.Errorf(codes.Internal, "failed to publish message: %v", err)
+	}
+
+	s.logger.Printf("Publish: successfully published to key '%s'", req.Key)
+	return &emptypb.Empty{}, nil
+}
+
+// Subscribe обрабатывает запрос на подписку
+func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.PubSub_SubscribeServer) error {
+	if req.Key == "" {
+		s.logger.Printf("Subscribe: received empty key")
+		return status.Error(codes.InvalidArgument, "key cannot be empty")
+	}
+
+	s.logger.Printf("Subscribe: new subscription for key '%s'", req.Key)
+
+	// messageHandler будет вызываться subpub движком для каждого сообщения
+	messageHandler := func(msgInterface interface{}) {
+		// Сообщения от subpub приходят как interface{}.
+		// В Publish мы отправляем string, поэтому здесь ожидаем string.
+		msgData, ok := msgInterface.(string)
+		if !ok {
+			s.logger.Printf("Subscribe: received non-string message for key '%s': type %T, value: %v. Skipping.", req.Key, msgInterface, msgInterface)
+			return // Пропускаем сообщения не-строкового типа
+		}
+
+		event := &pb.Event{Data: msgData}
+		if err := stream.Send(event); err != nil {
+			// Ошибка отправки, скорее всего клиент отсоединился
+			s.logger.Printf("Subscribe: error sending event to stream for key '%s': %v. Client likely disconnected.", req.Key, err)
+			// Дальнейшая обработка ошибки (например, отписка) будет выполнена ниже,
+			// когда stream.Context().Done() сработает или вернется ошибка из stream.Send()
+			// (хотя stream.Send() обычно не возвращает ошибку, которую можно использовать для выхода из цикла,
+			// но stream.Context().Done() надежнее)
+		} else {
+			s.logger.Printf("Subscribe: sent event for key '%s', data: '%.20s...'", req.Key, msgData)
+		}
+	}
+
+	subscription, err := s.subpubEngine.Subscribe(req.Key, messageHandler)
+	if err != nil {
+		s.logger.Printf("Subscribe: error subscribing to key '%s': %v", req.Key, err)
+		return status.Errorf(codes.Internal, "failed to subscribe: %v", err)
+	}
+	// Гарантируем отписку при завершении этой функции (например, клиент отсоединился)
+	defer func() {
+		s.logger.Printf("Subscribe: unsubscribing from key '%s' due to stream closure or error", req.Key)
+		subscription.Unsubscribe()
+		s.logger.Printf("Subscribe: successfully unsubscribed from key '%s'", req.Key)
+	}()
+
+	s.logger.Printf("Subscribe: successfully subscribed to key '%s'. Waiting for messages or client disconnect.", req.Key)
+
+	// Держим соединение открытым и слушаем контекст стрима на предмет отмены (отключения клиента)
+	// Этот цикл блокирует до тех пор, пока клиент не отсоединится или сервер не остановит стрим.
+	// Ошибки из stream.Send() в messageHandler не приведут сюда напрямую, но если stream.Send() вернет ошибку,
+	// это обычно означает, что соединение разорвано, и stream.Context().Done() вскоре сработает.
+	select {
+	case <-stream.Context().Done():
+		s.logger.Printf("Subscribe: stream context done for key '%s'. Error: %v", req.Key, stream.Context().Err())
+		// Возвращаем ошибку контекста, если она есть (например, context.Canceled, context.DeadlineExceeded)
+		// Если это codes.Canceled, клиент увидит это как нормальное завершение стрима с его стороны.
+		err := stream.Context().Err()
+		if err != nil && err != context.Canceled { // Не логируем context.Canceled как ошибку сервера
+			return status.Errorf(codes.Unavailable, "stream ended: %v", err)
+		}
+		return nil // Нормальное завершение, если клиент отменил
+	}
+}
+```
+**Пояснения к `grpc_server.go`:**
+*   **`UnimplementedPubSubServer`**: Встраиваем для forward compatibility. Если в будущем в `.proto` добавятся методы, наш сервер не сломается при компиляции, а просто вернет `Unimplemented` для новых методов.
+*   **Инъекция `subpub.SubPub` и `logger`**: Через конструктор `NewGRPCServer`.
+*   **`Publish`**:
+    *   Проверяет входные данные (`key`, `data`).
+    *   Вызывает `s.subpubEngine.Publish()`. Важно, что `PublishRequest.Data` уже `string`, а `subpub.Publish` принимает `interface{}`, так что преобразование не нужно, `string` подходит под `interface{}`.
+    *   Преобразует ошибки `subpub` в gRPC статусы.
+*   **`Subscribe`**:
+    *   Это серверный стриминг.
+    *   Проверяет `req.Key`.
+    *   Создает `messageHandler`. Эта функция будет вызываться из горутины внутри `subpub` пакета.
+    *   `messageHandler` должен быть осторожен с доступом к `stream`, так как он может быть уже закрыт. `stream.Send()` возвращает ошибку, если стрим закрыт.
+    *   `subpub.Subscribe()` возвращает `Subscription`. Мы *обязательно* должны вызвать `subscription.Unsubscribe()` когда клиент отсоединяется или происходит ошибка. `defer` отлично для этого подходит.
+    *   `<-stream.Context().Done()`: Это ключевой момент для серверных стримов. Этот канал закрывается, когда gRPC стрим завершается (клиент отсоединился, таймаут, или сервер сам его закрыл). После этого `defer` вызовет `Unsubscribe()`.
+*   **Логирование**: Простое использование `log.Printf`. В реальном приложении лучше использовать структурированный логгер (например, `zap` или `logrus`).
+*   **Типы сообщений**: `PublishRequest.Data` это `string`. `Event.Data` это `string`. `subpub` работает с `interface{}`. В `Publish` мы передаем `string` в `subpub`. В `messageHandler` для `Subscribe` мы ожидаем `string` из `subpub` (через type assertion `msgInterface.(string)`). Если придут другие типы, мы их логируем и пропускаем.
+
+**Шаг 5: Создание `main` приложения (`cmd/server/main.go`)**
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection" // Для удобства отладки через grpcurl или Postman
+
+	"github.com/your_username/grpc_pubsub_service/internal/service" // Замените на ваш путь
+	"github.com/your_username/grpc_pubsub_service/pkg/subpub"       // Замените на ваш путь
+	pb "github.com/your_username/grpc_pubsub_service/proto"         // Замените на ваш путь
+)
+
+const (
+	defaultPort         = "50051"
+	gracefulTimeout     = 5 * time.Second
+	subpubCloseTimeout  = 5 * time.Second
+)
+
+func main() {
+	// 1. Конфигурация (порт из переменной окружения или по умолчанию)
+	port := os.Getenv("GRPC_PORT")
+	if port == "" {
+		port = defaultPort
+	}
+	listenAddr := fmt.Sprintf(":%s", port)
+
+	// 2. Логгер
+	logger := log.New(os.Stdout, "GRPC_PUBSUB: ", log.LstdFlags|log.Lshortfile)
+
+	// 3. Инициализация subpub движка
+	subpubEngine := subpub.NewSubPub()
+	logger.Println("SubPub engine initialized")
+
+	// 4. Создание TCP listener
+	lis, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		logger.Fatalf("Failed to listen: %v", err)
+	}
+	logger.Printf("Server listening at %s", lis.Addr())
+
+	// 5. Создание gRPC сервера
+	grpcServer := grpc.NewServer(
+	// Можно добавить interceptors для логирования, метрик, аутентификации и т.д.
+	// grpc.UnaryInterceptor(...),
+	// grpc.StreamInterceptor(...),
+	)
+
+	// 6. Регистрация нашего сервиса
+	pubSubServiceServer := service.NewGRPCServer(subpubEngine, logger)
+	pb.RegisterPubSubServer(grpcServer, pubSubServiceServer)
+	logger.Println("PubSub gRPC service registered")
+
+	// Регистрация reflection service (полезно для утилит вроде grpcurl)
+	reflection.Register(grpcServer)
+	logger.Println("gRPC reflection service registered")
+
+	// 7. Graceful Shutdown
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			// Ошибка grpc.ErrServerClosed является нормальной при GracefulStop
+			if err != grpc.ErrServerClosed {
+				logger.Fatalf("Failed to serve gRPC: %v", err)
+			} else {
+				logger.Println("gRPC server gracefully stopped.")
+			}
+		}
+	}()
+
+	// Ожидание сигнала для завершения
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	logger.Printf("Received signal %v. Shutting down server...", sig)
+
+	// Даем время на завершение активных запросов gRPC
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), gracefulTimeout)
+	defer shutdownCancel()
+
+	done := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logger.Println("gRPC server finished active requests.")
+	case <-shutdownCtx.Done():
+		logger.Printf("gRPC server shutdown timed out after %s. Forcing stop.", gracefulTimeout)
+		grpcServer.Stop() // Принудительная остановка, если GracefulStop не успел
+	}
+
+	// Закрытие subpub движка
+	logger.Println("Closing SubPub engine...")
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), subpubCloseTimeout)
+	defer closeCancel()
+	if err := subpubEngine.Close(closeCtx); err != nil {
+		logger.Printf("Error closing SubPub engine: %v", err)
+	} else {
+		logger.Println("SubPub engine closed successfully.")
+	}
+
+	logger.Println("Server exited.")
+}
+```
+**Пояснения к `main.go`:**
+*   **Конфигурация**: Порт берется из `GRPC_PORT` или используется значение по умолчанию.
+*   **Логгер**: Простой `log.Logger`.
+*   **Инициализация `subpub`**: `subpub.NewSubPub()`.
+*   **gRPC Сервер**:
+    *   Создается `net.Listen` для TCP.
+    *   `grpc.NewServer()` создает экземпляр gRPC сервера.
+    *   `service.NewGRPCServer()` создает наш PubSub сервис, передавая ему `subpubEngine` (Dependency Injection).
+    *   `pb.RegisterPubSubServer()` регистрирует наш сервис.
+    *   `reflection.Register()`: позволяет gRPC клиентам (например, `grpcurl`) запрашивать схему сервиса. Очень удобно для тестирования.
+*   **Graceful Shutdown**:
+    *   Сервер запускается в отдельной горутине `go grpcServer.Serve(lis)`.
+    *   Основная горутина ждет сигналов `SIGINT` (Ctrl+C) или `SIGTERM`.
+    *   При получении сигнала:
+        1.  Вызывается `grpcServer.GracefulStop()`. Этот метод перестает принимать новые соединения и ждет завершения текущих обработчиков RPC в течение некоторого времени.
+        2.  Используется контекст с таймаутом (`gracefulTimeout`) для `GracefulStop`. Если таймаут истекает, вызывается `grpcServer.Stop()` для принудительной остановки.
+        3.  После остановки gRPC сервера, вызывается `subpubEngine.Close()` также с таймаутом (`subpubCloseTimeout`) для корректного завершения работы всех подписчиков и горутин в `subpub`.
+
+**Шаг 6: `README.md`**
+
+Создайте файл `README.md` с примерно таким содержанием:
+
+```markdown
+# gRPC Pub/Sub Service
+
+Это реализация простого Pub/Sub сервиса с использованием gRPC и кастомной in-memory шины сообщений.
+
+## Описание
+
+Сервис предоставляет две gRPC-ручки:
+
+1.  **`Publish(PublishRequest) returns (google.protobuf.Empty)`**
+    *   Принимает `key` (тема) и `data` (сообщение в виде строки).
+    *   Публикует сообщение в указанную тему.
+    *   Все активные подписчики на эту тему получат это сообщение.
+
+2.  **`Subscribe(SubscribeRequest) returns (stream Event)`**
+    *   Принимает `key` (тема).
+    *   Подписывает клиента на получение сообщений из указанной темы.
+    *   Сервер будет стримить `Event` (содержащий строковые `data`) клиенту по мере их поступления.
+    *   Подписка активна до тех пор, пока клиент не отсоединится.
+
+Внутренняя шина сообщений (`pkg/subpub`):
+*   Поддерживает множество подписчиков на одну тему.
+*   Медленные подписчики не блокируют доставку сообщений другим.
+*   Сообщения доставляются асинхронно. Порядок FIFO для конкретного подписчика сохраняется, но не гарантируется между разными подписчиками.
+*   Поддерживает graceful shutdown.
+
+## Зависимости
+
+*   Go (версия 1.18+)
+*   `protoc` компилятор
+*   Go плагины для `protoc`:
+    *   `protoc-gen-go`
+    *   `protoc-gen-go-grpc`
+
+Установка плагинов:
+```bash
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+```
+Убедитесь, что `$GOPATH/bin` (или `$HOME/go/bin`) находится в вашем `PATH`.
+
+## Сборка и запуск
+
+1.  **Инициализация модуля Go (если это новый проект):**
+    ```bash
+    go mod init github.com/your_username/grpc_pubsub_service # Замените на ваш путь
+    go get .
+    go mod tidy
+    ```
+    *Не забудьте обновить пути в `option go_package` в `proto/pubsub.proto` и импорты в `.go` файлах, если вы меняете путь модуля.*
+
+2.  **Генерация Protobuf кода:**
+    ```bash
+    make proto
+    ```
+
+3.  **Сборка бинарного файла:**
+    ```bash
+    make build
+    ```
+    Бинарный файл будет создан в `./bin/grpc_pubsub_server`.
+
+4.  **Запуск сервера:**
+    ```bash
+    make run
+    ```
+    Или напрямую:
+    ```bash
+    ./bin/grpc_pubsub_server
+    ```
+    По умолчанию сервер запускается на порту `50051`. Порт можно изменить, установив переменную окружения `GRPC_PORT`:
+    ```bash
+    GRPC_PORT= другой_порт ./bin/grpc_pubsub_server
+    ```
+
+## Тестирование (например, с `grpcurl`)
+
+Установите `grpcurl` (https://github.com/fullstorydev/grpcurl).
+
+1.  **Листинг сервисов (если reflection включен):**
+    ```bash
+    grpcurl -plaintext localhost:50051 list
+    ```
+    Ожидаемый вывод:
+    ```
+    proto.PubSub
+    grpc.reflection.v1alpha.ServerReflection
+    ```
+
+2.  **Описание сервиса:**
+    ```bash
+    grpcurl -plaintext localhost:50051 describe proto.PubSub
+    ```
+
+3.  **Подписка на тему (в одном терминале):**
+    ```bash
+    grpcurl -plaintext -d '{"key": "news"}' localhost:50051 proto.PubSub.Subscribe
+    ```
+    Этот терминал будет ожидать сообщений.
+
+4.  **Публикация сообщения (в другом терминале):**
+    ```bash
+    grpcurl -plaintext -d '{"key": "news", "data": "Hello from grpcurl!"}' localhost:50051 proto.PubSub.Publish
+    ```
+    Вы должны увидеть пустое тело ответа `{}`. В первом терминале (где подписка) появится:
+    ```json
+    {
+      "data": "Hello from grpcurl!"
+    }
+    ```
+
+    Опубликуйте еще несколько сообщений:
+    ```bash
+    grpcurl -plaintext -d '{"key": "news", "data": "Another message."}' localhost:50051 proto.PubSub.Publish
+    grpcurl -plaintext -d '{"key": "alerts", "data": "This is an alert!"}' localhost:50051 proto.PubSub.Publish
+    ```
+    Подписчик на "news" получит "Another message.", но не "This is an alert!".
+
+## Конфигурация
+
+*   **`GRPC_PORT`**: Переменная окружения для установки порта gRPC сервера (по умолчанию `50051`).
+
+## Логирование
+
+Сервис использует стандартный Go пакет `log` для вывода информации о своей работе в `stdout`. Логи включают временные метки и имя файла/номер строки для облегчения отладки.
+
+## Паттерны
+
+*   **Dependency Injection**: Экземпляр `subpub.SubPub` передается в gRPC сервис через конструктор.
+*   **Graceful Shutdown**: Сервер корректно обрабатывает сигналы `SIGINT` и `SIGTERM`, давая время на завершение активных gRPC запросов и закрытие `subpub` движка.
+*   **Unimplemented Server**: Используется `pb.UnimplementedPubSubServer` для обратной совместимости.
+*   **Context Propagation**: Контексты используются для управления временем жизни операций и для отмены (например, `stream.Context().Done()` в `Subscribe`).
+```
+
+**Финальные шаги:**
+
+1.  Убедитесь, что все пути импорта (`github.com/your_username/grpc_pubsub_service/...`) в Go файлах и `go_package` в `.proto` файле соответствуют вашему реальному пути модуля.
+2.  Выполните `go mod tidy`, чтобы убедиться, что все зависимости корректно указаны в `go.mod` и `go.sum`.
+3.  Протестируйте сборку и запуск с помощью `Makefile`:
+    *   `make clean` (для очистки старых генераций)
+    *   `make proto`
+    *   `make build`
+    *   `make run`
+4.  Протестируйте функциональность с `grpcurl` как описано в `README.md`.
+5.  Загрузите все это в GitHub репозиторий.
+
+Этот план покрывает все требования из задания. Код для `subpub` был взят как есть, а gRPC сервис построен поверх него с учетом лучших практик. Если есть какие-то моменты, которые нужно уточнить или изменить, дай знать!
